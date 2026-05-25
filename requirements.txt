@@ -1,2 +1,4 @@
 mujoco
 mediapy
+gymnasium
+stable-baselines3
