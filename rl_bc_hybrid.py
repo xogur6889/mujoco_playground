@@ -6,14 +6,15 @@ import random
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import torch.nn.functional as F
 
 # ==========================================
-# 1. 환경 (Env) - Delta Control 완벽 유지
+# 1. 환경 (Env) - Delta Control 
 # ==========================================
-class MujocoPurePPOEnv:
+class MujocoHybridPPOEnv:
     def __init__(self):
         xml = """
-        <mujoco model="sb3_clone_arm">
+        <mujoco model="hybrid_bc_ppo_arm">
           <compiler angle="radian"/>
           <option gravity="0 0 -9.81" timestep="0.01"/>
           <worldbody>
@@ -76,7 +77,7 @@ class MujocoPurePPOEnv:
     def step(self, action):
         self.current_step += 1
         
-        # Delta Control 유지 (부드러운 조향)
+        # Delta Control (상대적 제어)
         action = np.clip(action, -1.0, 1.0)
         max_step_size = 0.1
         target_ctrl = self.data.ctrl[:3] + (action * max_step_size)
@@ -112,10 +113,34 @@ class MujocoPurePPOEnv:
         return False
 
 # ==========================================
-# 2. SB3 아키텍처 완벽 이식 (신경망)
+# 2. 수학 전문가 (Expert IK) - 행동 복제용 정답지 생성기
+# ==========================================
+def get_ik_action(env):
+    error = env.target_pos - env.data.site_xpos[env.ee_site_id]
+    
+    # 에러 캡핑: 자코비안 붕괴 방지
+    error_norm = np.linalg.norm(error)
+    max_step_dist = 0.05 
+    if error_norm > max_step_dist:
+        error = (error / error_norm) * max_step_dist
+        
+    jacp = np.zeros((3, env.model.nv))
+    mujoco.mj_jacSite(env.model, env.data, jacp, None, env.ee_site_id)
+    
+    damping = 0.1
+    inv_term = np.linalg.inv(jacp @ jacp.T + (damping ** 2) * np.eye(3))
+    delta_q = jacp.T @ inv_term @ error * 0.5 
+    
+    # 현재 모터 명령을 기준으로 델타 제어 규격[-1, 1]에 맞춘 완벽한 정답 생성
+    desired_q = env.data.qpos[:3] + delta_q
+    action = (desired_q - env.data.ctrl[:3]) / 0.1
+    
+    return np.clip(action, -1.0, 1.0)
+
+# ==========================================
+# 3. SB3 PPO 아키텍처 완벽 이식 (신경망)
 # ==========================================
 def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
-    """[핵심 1] SB3의 직교 가중치 초기화 기법 (기울기 소실/폭발 완벽 방지)"""
     torch.nn.init.orthogonal_(layer.weight, std)
     torch.nn.init.constant_(layer.bias, bias_const)
     return layer
@@ -123,7 +148,6 @@ def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
 class SB3ActorCritic(nn.Module):
     def __init__(self):
         super().__init__()
-        # [핵심 2] 뉴런이 죽지 않도록 ReLU 대신 Tanh 사용 (SB3 MlpPolicy 기본값)
         self.critic = nn.Sequential(
             layer_init(nn.Linear(9, 64)), nn.Tanh(),
             layer_init(nn.Linear(64, 64)), nn.Tanh(),
@@ -132,15 +156,14 @@ class SB3ActorCritic(nn.Module):
         self.actor = nn.Sequential(
             layer_init(nn.Linear(9, 64)), nn.Tanh(),
             layer_init(nn.Linear(64, 64)), nn.Tanh(),
-            layer_init(nn.Linear(64, 3), std=0.01) # Action 출력은 변동성을 최소화
+            layer_init(nn.Linear(64, 3), std=0.01)
         )
-        # SB3는 로그 표준편차를 0(표준편차=1)으로 초기화하여 초반 탐험을 극대화합니다.
         self.actor_logstd = nn.Parameter(torch.zeros(1, 3))
 
     def get_value(self, x):
         return self.critic(x)
 
-    def get_action_and_value(self, x, action=None):
+    def get_action_and_value_and_mean(self, x, action=None):
         action_mean = self.actor(x)
         action_logstd = self.actor_logstd.expand_as(action_mean)
         action_std = torch.exp(action_logstd)
@@ -149,39 +172,40 @@ class SB3ActorCritic(nn.Module):
         if action is None:
             action = probs.sample()
             
-        return action, probs.log_prob(action).sum(1), probs.entropy().sum(1), self.critic(x)
+        # BC Loss 계산을 위해 action_mean을 추가로 반환합니다.
+        return action, probs.log_prob(action).sum(1), probs.entropy().sum(1), self.critic(x), action_mean
 
 # ==========================================
-# 3. SB3 PPO 학습 루프 (GAE + Mini-batch)
+# 4. 논문 수식(1)이 결합된 하이브리드 PPO 학습 루프
 # ==========================================
 TRAIN_MODE = False
 
 if __name__ == "__main__":
-    env = MujocoPurePPOEnv()
+    env = MujocoHybridPPOEnv()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = SB3ActorCritic().to(device)
     optimizer = optim.Adam(model.parameters(), lr=0.0003, eps=1e-5)
     
-    # SB3 PPO 기본 하이퍼파라미터
-    num_steps = 2048       # 롤아웃 버퍼 크기 (한 번에 2048 스텝 수집)
-    batch_size = 64        # [핵심 3] 미니 배치 크기
-    n_epochs = 10          # 수집된 데이터로 10번 반복 학습
+    # 하이퍼파라미터
+    num_steps = 2048       
+    batch_size = 64        
+    n_epochs = 10          
     gamma = 0.99
     gae_lambda = 0.95
     clip_coef = 0.2
     ent_coef = 0.01
+    beta_bc = 2.0  # [논문] 행동 복제(BC)의 영향력 가중치
 
     if TRAIN_MODE:
-        print("🚀 [학습 모드] SB3 엔진을 완벽히 이식한 순수 PyTorch PPO 학습을 시작합니다!")
+        print("🚀 [학습 모드] 전문가 IK 정답지를 결합한 'Behavioral-Cloning PPO'를 시작합니다!")
         start_time = time.time()
         
-        # 총 250번의 업데이트 (250 * 2048 = 약 50만 스텝)
-        num_updates = 250 
-        global_step = 0
+        # 💡 정답지가 있으므로 250번(50만 스텝)이 아닌 100번(20만 스텝)만에 PPO를 압도합니다!
+        num_updates = 100 
         
-        # 메모리 버퍼 초기화
         obs_buf = torch.zeros((num_steps, 9)).to(device)
         actions_buf = torch.zeros((num_steps, 3)).to(device)
+        expert_actions_buf = torch.zeros((num_steps, 3)).to(device) # 전문가 정답지 버퍼 추가
         logprobs_buf = torch.zeros((num_steps)).to(device)
         rewards_buf = torch.zeros((num_steps)).to(device)
         dones_buf = torch.zeros((num_steps)).to(device)
@@ -194,15 +218,18 @@ if __name__ == "__main__":
             ep_rewards = []
             current_ep_reward = 0
             
-            # 1. Rollout 수집 (2,048 스텝)
+            # 1. Rollout 수집 
             for step in range(num_steps):
-                global_step += 1
                 obs_buf[step] = next_obs
                 dones_buf[step] = next_done
                 
                 with torch.no_grad():
-                    action, logprob, _, value = model.get_action_and_value(next_obs.unsqueeze(0))
+                    action, logprob, _, value, _ = model.get_action_and_value_and_mean(next_obs.unsqueeze(0))
                     values_buf[step] = value.flatten()
+                    
+                    # [핵심 수집] 만약 전문가(IK)였다면 이 순간에 어떤 행동을 내렸을까?
+                    expert_act = get_ik_action(env)
+                    expert_actions_buf[step] = torch.FloatTensor(expert_act).to(device)
                 
                 actions_buf[step] = action
                 logprobs_buf[step] = logprob
@@ -220,7 +247,7 @@ if __name__ == "__main__":
                     current_ep_reward = 0
                     next_obs = torch.Tensor(env.reset()).to(device)
 
-            # 2. GAE (Generalized Advantage Estimation) 계산
+            # 2. GAE 계산
             with torch.no_grad():
                 next_value = model.get_value(next_obs.unsqueeze(0)).reshape(1, -1)
                 advantages = torch.zeros_like(rewards_buf).to(device)
@@ -236,23 +263,22 @@ if __name__ == "__main__":
                     advantages[t] = lastgaelam = delta + gamma * gae_lambda * nextnonterminal * lastgaelam
                 returns = advantages + values_buf
 
-            # 3. 미니 배치 기반 PPO 최적화 (망각 방지)
+            # 3. PPO + BC 최적화 (논문 수식 반영)
             b_inds = np.arange(num_steps)
             for epoch in range(n_epochs):
-                np.random.shuffle(b_inds) # 데이터 섞기
+                np.random.shuffle(b_inds) 
                 for start in range(0, num_steps, batch_size):
                     end = start + batch_size
                     mb_inds = b_inds[start:end]
                     
-                    _, newlogprob, entropy, newvalue = model.get_action_and_value(obs_buf[mb_inds], actions_buf[mb_inds])
+                    # 신경망의 현재 출력(newmean)을 가져옴
+                    _, newlogprob, entropy, newvalue, newmean = model.get_action_and_value_and_mean(obs_buf[mb_inds], actions_buf[mb_inds])
+                    
+                    # PPO Surrogate Loss
                     logratio = newlogprob - logprobs_buf[mb_inds]
                     ratio = logratio.exp()
-                    
-                    # 어드밴티지 정규화
                     mb_advantages = advantages[mb_inds]
                     mb_advantages = (mb_advantages - mb_advantages.mean()) / (mb_advantages.std() + 1e-8)
-                    
-                    # PPO 클리핑 목적함수
                     pg_loss1 = -mb_advantages * ratio
                     pg_loss2 = -mb_advantages * torch.clamp(ratio, 1 - clip_coef, 1 + clip_coef)
                     pg_loss = torch.max(pg_loss1, pg_loss2).mean()
@@ -260,24 +286,29 @@ if __name__ == "__main__":
                     v_loss = 0.5 * ((newvalue.view(-1) - returns[mb_inds]) ** 2).mean()
                     entropy_loss = entropy.mean()
                     
-                    loss = pg_loss - ent_coef * entropy_loss + v_loss * 0.5
+                    # === [논문 핵심: BC Loss] ===
+                    # 인공지능이 전문가(IK)의 행동 궤적을 닮도록 강제 (MSE Loss 활용)
+                    mb_expert_actions = expert_actions_buf[mb_inds]
+                    bc_loss = F.mse_loss(newmean, mb_expert_actions)
+                    
+                    # [최종 Loss] PPO 기본 로직 + 행동 복제(BC)
+                    loss = pg_loss - ent_coef * entropy_loss + v_loss * 0.5 + (beta_bc * bc_loss)
                     
                     optimizer.zero_grad()
                     loss.backward()
                     nn.utils.clip_grad_norm_(model.parameters(), 0.5)
                     optimizer.step()
 
-            # 로그 출력
             avg_reward = np.mean(ep_rewards) if len(ep_rewards) > 0 else 0
-            if update % 10 == 0:
-                print(f"Update {update:3d}/{num_updates} | Avg Reward: {avg_reward:7.1f} | Policy Loss: {pg_loss.item():.4f}")
+            if update % 5 == 0:
+                print(f"Update {update:3d}/{num_updates} | Avg Reward: {avg_reward:7.1f} | BC Loss: {bc_loss.item():.4f}")
 
-        torch.save(model.state_dict(), "sb3_clone_ppo.pth")
-        print(f"✅ SB3 이식 PPO 학습 완료! 소요 시간: {time.time() - start_time:.2f}초")
+        torch.save(model.state_dict(), "hybrid_bc_ppo.pth")
+        print(f"✅ 하이브리드(PPO+BC) 학습 완료! 소요 시간: {time.time() - start_time:.2f}초")
 
     else:
-        print("🎮 [테스트 모드] SB3와 100% 동일하게 훈련된 델타 제어 AI를 테스트합니다.")
-        model.load_state_dict(torch.load("sb3_clone_ppo.pth"))
+        print("🎮 [테스트 모드] 전문가의 부드러움과 RL의 유연성이 결합된 모델을 테스트합니다.")
+        model.load_state_dict(torch.load("hybrid_bc_ppo.pth"))
         model.eval()
         
         state = env.reset()
@@ -287,14 +318,13 @@ if __name__ == "__main__":
                 
                 state_ts = torch.FloatTensor(state).unsqueeze(0).to(device)
                 with torch.no_grad():
-                    # 테스트 시에는 확률 변동성 없이 평균값(mean)으로 안정적인 제어
                     mean_action = model.actor(state_ts)
                 
                 state, reward, done = env.step(mean_action.cpu().numpy()[0])
                 
                 if done:
                     if reward > 0:
-                        print("🎉 [PPO 마스터] 중력을 이겨내고 부드러운 타격 성공!")
+                        print("🎉 [하이브리드 AI] IK의 궤적과 RL의 문제해결력으로 타격 성공!")
                         env.model.geom_rgba[env.target_geom_id] = [0.2, 1.0, 0.2, 1.0]
                         viewer.sync()
                         time.sleep(1.0)
