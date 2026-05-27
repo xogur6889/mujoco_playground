@@ -1,25 +1,33 @@
-# 🤖 MuJoCo Playground
+# BC-A2C 기반 로봇 팔 희소 보상 환경 학습 효율성 증명
 
-이 저장소는 **MuJoCo** 물리 엔진을 로컬 PC의 무거운 환경 구축 없이 **Google Colab** 환경에서 가볍게 테스트하고 실행해 보기 위해 만들어진 플레이그라운드입니다. [DeepMind의 MuJoCo Playground](https://github.com/google-deepmind/mujoco_playground) 프로젝트에서 영감을 받아 작성되었습니다.
+## 1. 개요 및 목적
+본 실험은 **행동 복제 기반 Advantage Actor-Critic (BC-A2C)** 알고리즘을 로봇 팔(MuJoCo) 환경에 적용하여, 탐색이 어려운 **희소 보상(Sparse Reward)** 문제에서 학습 효율성을 증명하는 것을 목적으로 합니다. 전문가의 데이터를 활용하여 초기 탐색 성능을 개선하고 보상을 극대화하는 하이브리드 접근법의 유효성을 검증합니다.
 
-## 🚀 Quick Start (Google Colab)
+## 2. 환경 설정
+우연한 성공(바늘구멍 찾기)을 방지하고 환경의 난이도를 높이기 위해 다음과 같은 설정을 적용했습니다.
+- **타겟 크기:** 0.02 (표준 대비 대폭 축소)
+- **보상 체계:** 진척도 보상(Progress Reward)을 완전히 제거한 가혹한 희소 보상 환경 구성
 
-아래의 "Open In Colab" 뱃지를 클릭하면 각 주피터 노트북 파일이 여러분의 코랩 환경에서 즉시 열립니다. 원하는 테스트 환경을 선택해 보세요.
+## 3. 상태, 행동, 보상 체계
 
-### 1. 기본 환경 테스트 (기초)
-[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/xogur6889/mujoco_playground/blob/main/mujoco_colab_test.ipynb)
-- **내용**: 중력에 의해 바닥으로 떨어지는 빨간색 큐브를 통해 MuJoCo 엔진 및 렌더러가 정상 작동하는지 검증합니다.
+| 구분 | 상세 내용 |
+| :--- | :--- |
+| **상태 (State)** | 총 9차원: 관절 위치 3개(qpos), 엔드이펙터 좌표 3개, 타겟 좌표 3개 |
+| **행동 (Action)** | 총 3차원: 각 관절의 델타(상대적) 목표 위치 (-1.0 ~ 1.0 클리핑, step size 0.05) |
+| **보상 (Reward)** | - 매 스텝 생존 페널티: -0.05<br>- 에너지 페널티: -(행동² * 0.01)<br>- 타겟 터치 성공 시: +100점 |
 
-### 2. ALOHA 양팔 로봇 테스트 (심화)
-[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/xogur6889/mujoco_playground/blob/main/aloha_colab_test.ipynb)
-- **내용**: 구글 딥마인드의 공식 로봇 저장소(`mujoco_menagerie`)에서 ALOHA 쌍팔 로봇 모델을 불러와 부드럽게 조종하고 렌더링합니다.
+## 4. 실험 결과
+100회 에피소드 평가 결과는 다음과 같습니다.
 
-## ✨ Features
-- **Headless Rendering**: 화면 창(GUI)을 띄울 수 없는 코랩 환경의 특성을 고려하여, `mediapy`를 활용해 시뮬레이션 결과를 MP4 비디오 형태로 렌더링합니다.
-- **DeepMind Menagerie Integration**: 딥마인드 공식 깃허브와 연동하여 실제 연구용 로봇 모델을 가볍게 불러와 볼 수 있습니다.
+| 모델 | 성공률 | 평균 보상 | 평균 스텝 수 |
+| :--- | :---: | :---: | :---: |
+| 순수 PPO | 0.0% | -15.5 | 300 |
+| 휴리스틱 IK | 56.0% | 45.6 | 188 |
+| **제안 기법 (Hybrid PPO+BC)** | **81.0%** | **75.3** | **99** |
 
-## 🛠️ Local Installation (Optional)
-만약 로컬 PC 환경에서 실행하고자 한다면 아래 명령어로 의존성을 설치하세요:
-```bash
-pip install -r requirements.txt
-```
+![결과 그래프](paper_results_figure.png)
+
+## 5. 결과 분석
+- **압도적인 성능:** 제안된 Hybrid PPO+BC 기법은 순수 PPO가 전혀 해결하지 못한 가혹한 희소 보상 환경에서 **81.0%라는 압도적인 성공률**을 달성했습니다.
+- **학습 효율성:** 전문가(IK) 궤적을 모방함으로써 단순한 휴리스틱 알고리즘보다 더 최적화된 경로를 찾아냈으며, 가장 적은 평균 스텝(99스텝)으로 목표에 도달하는 높은 효율성을 보였습니다.
+- **결론:** BC-A2C(Hybrid) 방식이 로봇 제어의 희소 보상 문제를 해결하는 데 매우 강력한 도구임을 확인했습니다.
