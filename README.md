@@ -74,7 +74,7 @@
 @article{choi2024approaches,
   title={Approaches That Use Domain-Specific Expertise: Behavioral-Cloning-Based Advantage Actor-Critic in Basketball Games},
   author={Choi, Taehyeok},
-  year={2024}
+  year={2023}
 }
 ```
 
