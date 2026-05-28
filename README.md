@@ -48,7 +48,7 @@
 
 | Base PPO (기존 실패) | Pure Expert (전문가 시범) | Final Hybrid PPO (최종 성공) |
 | :---: | :---: | :---: |
-| <video src="result_ppo_base.mp4" width="100%" autoplay loop muted></video> | <video src="result_expert.mp4" width="100%" autoplay loop muted></video> | <video src="result_ppo_final.mp4" width="100%" autoplay loop muted></video> |
+| ![Base PPO](result_ppo_base.gif) | ![Pure Expert](result_expert.gif) | ![Final Hybrid PPO](result_ppo_final.gif) |
 
 ### 3. 상태(State), 행동(Action), 보상(Reward) 설계 요약
 
